@@ -1,0 +1,667 @@
+---
+title: "Data Translation"
+author: "Conner Deal"
+date: "3/17/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Our goal is to figure out the effect that COVID-19 has had on the health of the retail sector and the economy as a whole. In this report, we look at the Current Population Survey released by IPUMS, which is the database that the government often uses to understand the changes in employment. Our analysis strives to answer the following 3 questions: 1) How has COVID affected the health of the retail industry, as measured by employment? 2) How has retail fared relative to other industries? 3) Retail needs to worry about who has money to spend - what has changed about who is working and earning money? 
+
+We utilize data from IPUMS to address our interests with the health of the retail and non-retail industries. In the data from IPUMS, we selected a handful of variables including sex, education, race, marital status, employment status, and age generation group. We leverage these variables to explore shifts in employment due to COVID-19 with linear probability models and logit models. 
+
+## Libraries
+
+Loading necessary libraries to conduct our analysis.
+
+```{r Libraries}
+
+library(ipumsr)
+library(tidyverse)
+library(jtools)
+library(vtable)
+library(haven)
+library(lubridate)
+library(fixest)
+library(tidylog)
+library(estimatr)
+library(ggplot2)
+library(dplyr)
+library(margins)
+
+```
+
+## Loading in the data...
+
+```{r Loading data}
+
+ddi <- read_ipums_ddi("cps_00004.xml")
+data <- read_ipums_micro(ddi)
+summary(data)
+
+```
+
+## Cleaning the data
+
+Before performing our analysis, there are many steps required to clean the data, the first being attaching our industry names to isolate for retail industry vs. non-retail. 
+
+```{r Cleaning the data}
+
+ind_df <- read_csv('indnames.csv')
+ind_df <- rename(ind_df, IND = ind)
+df <- left_join(data, ind_df, by = 'IND')
+
+df <- rename(df, INDUSTRY = indname)
+
+table(df$INDUSTRY)
+
+```
+##### Filtering varibles
+
+We also need to filter out unnecessary data from ASEC records. Annually (specifically in March), ASEC asks more detailed questions that result in one month containing a skewed amount of records, thus they are filtered out. Additionally, there are many records that do not have an associated industry and will also be dropped. At this point, we also decided to drop 2018 because the first reported case of COVID-19 in the United States was in February of 2020, meaning that 2019 was a full fiscal year without COVID, and this is sufficient for our data.
+
+
+```{r Filtering data}
+
+table(df$MONTH)
+
+df$ASECFLAG[is.na(df$ASECFLAG)] <- 0
+
+df <- df %>%
+  filter(ASECFLAG != 1) %>%
+  filter(YEAR > 2018) %>%
+  filter(INDUSTRY != "N/A")
+
+table(df$MONTH)
+
+
+  
+retail <- df %>%
+  filter(INDUSTRY == "Retail Trade")
+
+non_retail <- df %>%
+  filter(INDUSTRY != "Retail Trade")
+
+```
+
+##### Creating additional variables
+
+There are many variables that we need to modify in order to assist in our analysis. Our regressions will require categorical variables and other dummy variables for controls. We will also simplify how we define employment and unemployment to explore the health of the retail industry. For simplification, we will simply look at the labor force through a U-3 lens, where they are either employed or unemployed, no in between. 
+
+```{r Combining Year and Month columns}
+
+# Retail data
+retail$YEAR_MONTH <- str_c(retail$YEAR, "-", retail$MONTH)
+
+retail <- retail %>% 
+  mutate(YEAR_MONTH = ym(YEAR_MONTH))
+
+class(retail$YEAR_MONTH)
+table(retail$YEAR_MONTH)
+  
+# Non-retail data
+non_retail$YEAR_MONTH <- str_c(non_retail$YEAR, "-", non_retail$MONTH)
+
+non_retail <- non_retail %>% 
+  mutate(YEAR_MONTH = ym(YEAR_MONTH))
+
+class(non_retail$YEAR_MONTH)
+table(non_retail$YEAR_MONTH)
+  
+```
+
+Additionally, we can add IPUMS provided weights to find a total sum of the number of employed people per industry over the given months. This will then be used to isolate the 5 highest employed non-retail industries that we will use in our comparisons for our analysis.
+
+```{r Adding weight for survey data}
+
+# Retail data
+retail_weight <- retail %>% 
+  group_by(INDUSTRY, YEAR_MONTH) %>% 
+  summarize(number_employed = sum(WTFINL))
+
+# Non-retail data
+non_retail_weight <- non_retail %>% 
+  group_by(INDUSTRY, YEAR_MONTH) %>% 
+  summarize(number_employed = sum(WTFINL))
+
+# Finding top 5 industries to compare to retail
+non_retail_5  <- non_retail_weight %>%
+  select(INDUSTRY, number_employed) %>%
+  group_by(INDUSTRY) %>%
+  summarize(n = sum(number_employed))
+
+non_retail_5 <- non_retail_5 %>%
+   slice_max(order_by = n, n = 5)
+
+# Non-retail with only top 5
+non_retail <- non_retail %>%
+  filter(INDUSTRY %in% c("Arts, Entertainment, and Recreation, and Accommodation and Food Services",
+                        "Construction",
+                        "Educational Services, and Health Care and Social Assistance",
+                        "Manufacturing",
+                        "Professional, Scientific, and Management, and Administrative and Waste Management Services"))
+
+table(non_retail$INDUSTRY)
+
+# Update the non_retail_weight with a rerun that includes filters
+non_retail_weight <- non_retail %>% 
+  group_by(INDUSTRY, YEAR_MONTH) %>% summarize(number_employed = sum(WTFINL))
+
+```
+
+Our employment status variable records employment and unemployment on a U3 employment basis, meaning the labor only consists of employed and unemployed, no special cases.
+
+```{r Employment status variable}
+
+# Retail data
+table(retail$EMPSTAT)
+
+retail <- retail %>%
+  filter(EMPSTAT != 32
+         & EMPSTAT != 34
+         & EMPSTAT != 36)
+
+retail <- retail %>%
+  mutate(EMPLOYED = EMPSTAT < 21)
+
+table(retail$EMPLOYED)
+
+# Non-retail data
+table(non_retail$EMPSTAT)
+
+non_retail <- non_retail %>%
+  filter(EMPSTAT != 32
+         & EMPSTAT != 34
+         & EMPSTAT != 36)
+
+non_retail <- non_retail %>%
+  mutate(EMPLOYED = EMPSTAT < 21)
+
+table(non_retail$EMPLOYED)
+
+```
+
+```{r Calculating employment rate}
+
+retail_employment_rate <- retail %>%
+  group_by(YEAR_MONTH, EMPLOYED) %>%
+  summarize(n = sum(WTFINL)) %>%
+  mutate(LF = sum(n)) %>%
+  mutate(EMPLOY_RATE = (n/LF)*100) %>%
+  filter(EMPLOYED == 'TRUE')
+
+non_retail_employment_rate <- non_retail %>%
+  group_by(INDUSTRY, YEAR_MONTH, EMPLOYED) %>%
+  summarize(n = sum(WTFINL)) %>%
+  mutate(LF = sum(n)) %>%
+  mutate(EMPLOY_RATE = (n/LF)*100) %>%
+  filter(EMPLOYED == 'TRUE')
+
+
+retail_employment_graph <- ggplot() + 
+  geom_line(data = retail_employment_rate, aes(x = YEAR_MONTH, y = EMPLOY_RATE, color = EMPLOY_RATE), size = 1) +
+  geom_vline(xintercept = as.numeric(as.Date("2020-02-01")), linetype = 2) +
+  theme(panel.background = element_blank(),
+        axis.title.x = element_blank(), 
+        legend.title = element_blank()) +
+  labs(title = "Employment rate (%) over time for the retail industry",
+       subtitle = "Period indicates pre-, during, and post- COVID-19",
+       y = "Employment rate (%)",
+       caption = "Dotted line indicates February 2020, the month of the first reported case of COVID-19 in the US")
+retail_employment_graph
+
+non_retail_employment_graph <- ggplot() + 
+  geom_line(data = non_retail_employment_rate, aes(x = YEAR_MONTH, y = EMPLOY_RATE, color = INDUSTRY), size = 1) +
+  geom_vline(xintercept = as.numeric(as.Date("2020-02-01")), linetype = 2) +
+  theme(panel.background = element_blank(),
+        axis.title.x = element_blank(), 
+        legend.title = element_blank()) +
+  labs(title = "Employment rate (%) over time for the non-retail industries",
+       subtitle = "Period indicates pre-, during, and post- COVID-19",
+       y = "Employment rate (%)",
+       caption = "Dotted line indicates February 2020, the month of the first reported case of COVID-19 in the US")
+non_retail_employment_graph
+
+```
+
+Our sex variable captures male vs. female.
+
+```{r Sex binary variable}
+
+# Renaming and reclassifying Sex to work as binary for male vs. female
+# Retail data
+table(retail$SEX)
+
+retail <- retail %>%
+  mutate(MALE = SEX == 1)
+
+table(retail$MALE)
+
+# Non-retail data
+table(non_retail$SEX)
+
+non_retail <- non_retail %>%
+  mutate(MALE = SEX == 1)
+
+table(non_retail$MALE)
+
+```
+Our marital status variable will isolate individuals who have been married at least once, which combines records for: married, divorced, separated, widowed, etc. Non-married individuals are labeled as Single.
+
+```{r Marital status binary variable}
+
+# Marital status will be defined as Married ever or single
+# Retail data
+table(retail$MARST)
+
+retail <- retail %>%
+  mutate(MARRIED = MARST != 6)
+
+table(retail$MARRIED)
+
+# Non-retail data
+table(non_retail$MARST)
+
+non_retail <- non_retail %>%
+  mutate(MARRIED = MARST != 6)
+
+table(non_retail$MARRIED)
+
+```
+
+Our education variable classifies individuals based on level of schooling, ranging from high school level education to a doctorate degree.
+
+```{r Education categorical variable}
+
+# Retail data
+table(retail$EDUC)
+
+retail <- retail %>%
+  mutate(EDUCATION = case_when(EDUC == 111 ~ "Bachelor's Degree",
+                               EDUC %in% c(80:110) ~ "Some College",
+                               EDUC <= 73 ~ "High School",
+                               EDUC == 123 ~ "Master's Degree",
+                               EDUC == 124 ~ "Professional Degree",
+                               EDUC == 125 ~ "Doctorate Degree"))
+
+table(retail$EDUCATION)
+
+# Non-retail data
+table(non_retail$EDUC)
+
+non_retail <- non_retail %>%
+  mutate(EDUCATION = case_when(EDUC == 111 ~ "Bachelor's Degree",
+                               EDUC %in% c(80:110) ~ "Some College",
+                               EDUC <= 73 ~ "High School",
+                               EDUC == 123 ~ "Master's Degree",
+                               EDUC == 124 ~ "Professional Degree",
+                               EDUC == 125 ~ "Doctorate Degree"))
+
+table(non_retail$EDUCATION)
+
+```
+Our race variable groups mixed individuals and lesser represented populations as other to capture a stronger effect with the larger sample size. Major denominations are left as is.
+
+```{r Race categorical variable}
+
+# Retail data
+table(retail$RACE)
+
+retail <- retail %>%
+  mutate(RACE = case_when(RACE == 100 ~ "White",
+                          RACE == 200 ~ "Black",
+                          RACE == 300 ~ "Native",
+                          RACE == 651 ~ "Asian",
+                          RACE %in% c(652, 801:820, 830) ~ "Other"))
+
+table(retail$RACE)
+
+# Non-retail data
+table(non_retail$RACE)
+
+non_retail <- non_retail %>%
+  mutate(RACE = case_when(RACE == 100 ~ "White",
+                          RACE == 200 ~ "Black",
+                          RACE == 300 ~ "Native",
+                          RACE == 651 ~ "Asian",
+                          RACE %in% c(652, 801:820, 830) ~ "Other"))
+
+
+table(non_retail$RACE)
+
+```
+
+Our age variable classifies individuals according to their generation, as set by scholarly accepted birth year ranges.
+
+```{r Age group categorical variable}
+
+# Retail data
+
+table(retail$AGE)
+
+retail <- retail %>%
+  mutate(GENERATION = case_when(AGE %in% c(15:24) ~ "Generation_Z",
+                                AGE %in% c(25:41) ~ "Millennials",
+                                AGE %in% c(42:85) ~ "Generation_X"))
+
+table(retail$GENERATION)
+
+# Non-retail data
+table(non_retail$AGE)
+
+
+non_retail <- non_retail %>%
+  mutate(GENERATION = case_when(AGE %in% c(15:24) ~ "Generation_Z",
+                                AGE %in% c(25:41) ~ "Millennials",
+                                AGE %in% c(42:85) ~ "Generation_X"))
+
+
+table(non_retail$GENERATION)
+
+```
+
+Our COVID/time variable details COVID in a matter of time passed since the first case. This attempts to capture the shifts in safety protocols and vaccinations as time progressed from the first reported case. 
+
+```{r Detailing COVID}
+
+# Retail data
+table(retail$YEAR_MONTH)
+
+retail <- retail %>%
+mutate(SINCE_COVID = case_when(YEAR_MONTH <= ("2020-02-01") ~ "PRE-COVID",
+                                 YEAR_MONTH >= ("2020-03-01") & YEAR_MONTH <= ("2020-06-01") ~ "4 MONTHS",
+                                 YEAR_MONTH >= ("2020-07-01") & YEAR_MONTH <= ("2020-10-01") ~ "8 MONTHS",
+                                 YEAR_MONTH >= ("2020-11-01") & YEAR_MONTH  <= ("2021-02-01") ~ "12 MONTHS",
+                                 YEAR_MONTH >= ("2021-03-01") & YEAR_MONTH <= ("2021-06-01") ~ "16 MONTHS",
+                                 YEAR_MONTH >= ("2021-07-01") & YEAR_MONTH <= ("2021-10-01") ~ "20 MONTHS",
+                                 YEAR_MONTH > ("2021-10-01") ~ "PRESENT")) %>%
+  mutate(SINCE_COVID = factor(SINCE_COVID, levels = c("PRE-COVID",
+                                                      "4 MONTHS", 
+                                                      "8 MONTHS",
+                                                      "12 MONTHS",
+                                                      "16 MONTHS",
+                                                      "20 MONTHS",
+                                                      "PRESENT")))
+
+table(retail$SINCE_COVID)
+
+# Non-retail data
+table(non_retail$YEAR_MONTH)
+
+non_retail <- non_retail %>%
+mutate(SINCE_COVID = case_when(YEAR_MONTH <= ("2020-02-01") ~ "PRE-COVID",
+                                 YEAR_MONTH >= ("2020-03-01") & YEAR_MONTH <= ("2020-06-01") ~ "4 MONTHS",
+                                 YEAR_MONTH >= ("2020-07-01") & YEAR_MONTH <= ("2020-10-01") ~ "8 MONTHS",
+                                 YEAR_MONTH >= ("2020-11-01") & YEAR_MONTH  <= ("2021-02-01") ~ "12 MONTHS",
+                                 YEAR_MONTH >= ("2021-03-01") & YEAR_MONTH <= ("2021-06-01") ~ "16 MONTHS",
+                                 YEAR_MONTH >= ("2021-07-01") & YEAR_MONTH <= ("2021-10-01") ~ "20 MONTHS",
+                                 YEAR_MONTH > ("2021-10-01") ~ "PRESENT")) %>%
+  mutate(SINCE_COVID = factor(SINCE_COVID, levels = c("PRE-COVID",
+                                                      "4 MONTHS", 
+                                                      "8 MONTHS",
+                                                      "12 MONTHS",
+                                                      "16 MONTHS",
+                                                      "20 MONTHS",
+                                                      "PRESENT")))
+
+table(non_retail$SINCE_COVID)
+
+```
+
+##### Master data frames for retail and non-retail industries
+
+These data frames created will function as the master data frames for both retail and non-retail industries. It will include specific variables used for regression testing such as time since COVID and other demographic details for specific groups that we establish as the baseline.
+
+```{r Master data frames with specified variables}
+
+# Retail data
+retail_master <- retail %>%
+  select(YEAR_MONTH, EMPLOYED, MALE, MARRIED, EDUCATION, RACE, GENERATION, SINCE_COVID, WTFINL)
+
+# Non-retail data
+non_retail_master <- non_retail %>%
+  select(INDUSTRY, YEAR_MONTH, EMPLOYED, MALE, MARRIED, EDUCATION, RACE, GENERATION, SINCE_COVID, WTFINL)
+
+```
+
+## Analysis of the data - Retail
+
+```{r LM and Logit models for retail}
+
+# Running LPM model with retail industry, first with just SINCE_COVID, then with added controls.
+retail_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = retail_master)
+
+retail_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = retail_master)
+export_summs(retail_lpm1, retail_lpm2, robust = TRUE, digits = 3)
+
+# Running logit model
+retail_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = retail_master,
+            family = binomial(link = 'logit'))
+
+export_summs(retail_lpm2, retail_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of retail logit model
+retail_logm1 <- margins(retail_logit1)
+export_summs(retail_lpm2, retail_logm1, robust = TRUE, digits =3)
+
+ggplot(retail_master, aes(x = YEAR_MONTH, y = EMPLOYED*1)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE, color = 'blue') + 
+  geom_smooth(method = 'lm', se = FALSE, color = 'red') +  
+  geom_vline(xintercept = as.numeric(as.Date("2020-02-01")), linetype = 2) +
+  theme(panel.background = element_blank(),
+        axis.title.x = element_blank(), 
+        legend.title = element_blank()) +
+  labs(title = "Probability of Employment (0-100%) over time for the retail industry",
+       y = "Probability of Employment (%)",
+       caption = "Dotted line indicates February 2020, the month of the first reported case of COVID-19 in the US")
+
+# Final export summs with renamed columns
+
+export_summs(retail_lpm2, retail_logit1, retail_logm1, robust = TRUE, digits = 3, model.names = c("LPM", "LOGIT", "LOGIT MARGINS"))
+
+```
+
+## Analysis of the Data - Non-retail
+
+##### Construction
+```{r LM and Logit models for non-retail - Construction}
+
+# Running LPM model with non-retail industry, first with just SINCE_COVID, then with added controls. Filtered by industry.
+
+table(non_retail_master$INDUSTRY)
+
+# Construction, denoted by C
+# Running lpm for construction
+non_retail_C_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = non_retail_master %>% filter(INDUSTRY %in% "Construction"))
+
+non_retail_C_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = non_retail_master %>% filter(INDUSTRY %in% "Construction"))
+export_summs(non_retail_C_lpm1, non_retail_C_lpm2, robust = TRUE, digits = 3)
+
+
+# Running logit model for construction
+non_retail_C_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = non_retail_master %>% filter(INDUSTRY %in% "Construction"),
+            family = binomial(link = 'logit'))
+
+export_summs(non_retail_C_lpm2, non_retail_C_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of non-retail logit model
+non_retail_C_logm1 <- margins(non_retail_C_logit1)
+export_summs(non_retail_C_lpm2, non_retail_C_logm1, robust = TRUE, digits =3)
+
+# Non-retail industries employment probability
+ggplot(non_retail_master, aes(x = YEAR_MONTH, y = EMPLOYED*1)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE, color = 'blue') + 
+  geom_smooth(method = 'lm', se = FALSE, color = 'red') +  
+  geom_vline(xintercept = as.numeric(as.Date("2020-02-01")), linetype = 2) +
+  theme(panel.background = element_blank(),
+        axis.title.x = element_blank(), 
+        legend.title = element_blank()) +
+  labs(title = "Probability of Employment (0-100%) over time for the non-retail industries",
+       y = "Probability of Employment (%)",
+       caption = "Dotted line indicates February 2020, the month of the first reported case of COVID-19 in the US")
+
+```
+
+##### Manufacturing
+```{r LM and Logit models for non-retail - Manufacturing}
+
+# Running LPM model with non-retail industry, first with just SINCE_COVID, then with added controls. Filtered by industry.
+
+table(non_retail_master$INDUSTRY)
+
+# Manufacturing, denoted by M
+# Running lpm for manufacturing
+non_retail_M_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = non_retail_master %>% filter(INDUSTRY %in% "Manufacturing"))
+
+non_retail_M_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = non_retail_master %>% filter(INDUSTRY %in% "Manufacturing"))
+export_summs(non_retail_M_lpm1, non_retail_M_lpm2, robust = TRUE, digits = 3)
+
+
+# Running logit model for manufacturing
+non_retail_M_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = non_retail_master %>% filter(INDUSTRY %in% "Manufacturing"),
+            family = binomial(link = 'logit'))
+
+export_summs(non_retail_M_lpm2, non_retail_M_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of non-retail logit model
+non_retail_M_logm1 <- margins(non_retail_M_logit1)
+export_summs(non_retail_M_lpm2, non_retail_M_logm1, robust = TRUE, digits =3)
+
+```
+
+##### Arts, Entertainment, and Recreation, and Accommodation and Food Services
+```{r LM and Logit models for non-retail - Arts, Entertainment, and Recreation, and Accommodation and Food Services}
+
+# Running LPM model with non-retail industry, first with just SINCE_COVID, then with added controls. Filtered by industry.
+
+table(non_retail_master$INDUSTRY)
+
+# Arts, Entertainment, and Recreation, and Accommodation and Food Services, denoted by A
+# Running lpm for Arts, Entertainment, and Recreation, and Accommodation and Food Services
+non_retail_A_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = non_retail_master %>% filter(INDUSTRY %in% "Arts, Entertainment, and Recreation, and Accommodation and Food Services"))
+
+non_retail_A_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = non_retail_master %>% filter(INDUSTRY %in% "Arts, Entertainment, and Recreation, and Accommodation and Food Services"))
+export_summs(non_retail_A_lpm1, non_retail_A_lpm2, robust = TRUE, digits = 3)
+
+
+# Running logit model for manufacturing
+non_retail_A_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = non_retail_master %>% filter(INDUSTRY %in% "Arts, Entertainment, and Recreation, and Accommodation and Food Services"),
+            family = binomial(link = 'logit'))
+
+export_summs(non_retail_A_lpm2, non_retail_A_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of non-retail logit model
+non_retail_A_logm1 <- margins(non_retail_A_logit1)
+export_summs(non_retail_A_lpm2, non_retail_A_logm1, robust = TRUE, digits =3)
+
+```
+
+##### Educational Services, and Health Care and Social Assistance
+```{r LM and Logit models for non-retail - Educational Services, and Health Care and Social Assistance}
+
+# Running LPM model with non-retail industry, first with just SINCE_COVID, then with added controls. Filtered by industry.
+
+table(non_retail_master$INDUSTRY)
+
+# Educational Services, and Health Care and Social Assistance, denoted by E
+# Running lpm for Educational Services, and Health Care and Social Assistance
+non_retail_E_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = non_retail_master %>% filter(INDUSTRY %in% "Educational Services, and Health Care and Social Assistance"))
+
+non_retail_E_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = non_retail_master %>% filter(INDUSTRY %in% "Educational Services, and Health Care and Social Assistance"))
+export_summs(non_retail_E_lpm1, non_retail_E_lpm2, robust = TRUE, digits = 3)
+
+
+# Running logit model for manufacturing
+non_retail_E_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = non_retail_master %>% filter(INDUSTRY %in% "Educational Services, and Health Care and Social Assistance"),
+            family = binomial(link = 'logit'))
+
+export_summs(non_retail_E_lpm2, non_retail_E_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of non-retail logit model
+non_retail_E_logm1 <- margins(non_retail_E_logit1)
+export_summs(non_retail_E_lpm2, non_retail_E_logm1, robust = TRUE, digits =3)
+
+```
+
+##### Professional, Scientific, and Management, and Administrative and Waste Management Services
+```{r LM and Logit models for non-retail - Professional, Scientific, and Management, and Administrative and Waste Management Services}
+
+# Running LPM model with non-retail industry, first with just SINCE_COVID, then with added controls. Filtered by industry.
+
+table(non_retail_master$INDUSTRY)
+
+# Professional, Scientific, and Management, and Administrative and Waste Management Services, denoted by P
+# Running lpm for Professional, Scientific, and Management, and Administrative and Waste Management Services
+non_retail_P_lpm1 <- lm(EMPLOYED ~ SINCE_COVID, data = non_retail_master %>% filter(INDUSTRY %in% "Professional, Scientific, and Management, and Administrative and Waste Management Services"))
+
+non_retail_P_lpm2 <- lm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, data = non_retail_master %>% filter(INDUSTRY %in% "Professional, Scientific, and Management, and Administrative and Waste Management Services"))
+export_summs(non_retail_P_lpm1, non_retail_P_lpm2, robust = TRUE, digits = 3)
+
+
+# Running logit model for manufacturing
+non_retail_P_logit1 <- glm(EMPLOYED ~ SINCE_COVID + MALE + MARRIED + EDUCATION + RACE + GENERATION, 
+             data = non_retail_master %>% filter(INDUSTRY %in% "Professional, Scientific, and Management, and Administrative and Waste Management Services"),
+            family = binomial(link = 'logit'))
+
+export_summs(non_retail_P_lpm2, non_retail_P_logit1, robust = TRUE, digits = 3)
+
+# Check the marginal effects of non-retail logit model
+non_retail_P_logm1 <- margins(non_retail_P_logit1)
+export_summs(non_retail_P_lpm2, non_retail_P_logm1, robust = TRUE, digits =3)
+
+```
+
+##### Master comparison for Retail and Non-Retail industries
+```{r Comparison for Retail and Non-Retail industries}
+
+export_summs(retail_lpm2, non_retail_C_lpm2, non_retail_M_lpm2, non_retail_A_lpm2, non_retail_E_lpm2, non_retail_P_lpm2, robust = TRUE, digits = 3,
+             model.names = c("Retail",
+                             "Construction",
+                             "Manufacturing",
+                             "Arts, Entertainment, and Recreation, and Accommodation and Food Services",
+                             "Educational Services, and Health Care and Social Assistance",
+                             "Professional, Scientific, and Management, and Administrative and Waste Management Services"))
+
+```
+
+## Analysis
+
+We opted to utilize Logit modeling on our binary dependent variable, employment. Thus our regressions shifted to a linear probability model and logit model analysis, making coefficient interpretation simpler. In both retail and non-retail industries, we add our controls for our lpm models and run additional models with logit and logit margins to compare coefficients. Additionally, employment rate is approximated by our lpm, as a ~94.8% chance of being employed is roughly equivalent to 95% employment rate. Thus all coefficient interpretations can be extrapolated to be reflections of shift in employment rate. We attempt to control for heteroscedasticity in our models using Robust standard errors for all our regressions. We also assume no multi-collinearity.
+
+Our model assumes that people move from employed to unemployed only, and maintain in the labor force. Realistically, there are likely people who leave employment and leave the labor force as a whole, or alternatively, join employment and unemployment from previously being not in the labor force. We are only focused on maintenance of labor force and moving from employed to unemployed and vice versa. Additionally, the model assumes that COVID is the driver between the shift from employment to unemployment, and vice versa. There are likely other reasons for shifting between employed or not, but for the sake of our analysis we assume that it is only because of COVID.
+
+Our model uses COVID time elapsed (SINCE_COVID) as the independent variable to measure the effect of COVID on employment probability, hence the health of the retail and non-retail sectors. Each time interval for time passing encompasses the fluctuation of economic activity in the pandemic, such as lock-downs, restrictive mandates or capacity limits, and etc. This helps explain the resilience of some industries after significant time has passed. 
+
+Our demographics variables are used as controls to establish a baseline for what is the norm. We established binaries and categorical variables that essentially group records for major representation in each group, such as married vs. single, white vs. black vs. asian, education level, and generational difference. Our generational cutoffs were established based on research reports that generally agree what birth year falls into each category (1997-2021 = Gen Z, 119-1981 = Gen Y/Millennials, 1965-1980 = Gen X).
+
+##### Question 1
+
+**How has COVID affected the health of the retail industry, as measured by employment?**
+
+By looking at our coefficients on our lpm and logit margins regression for the retail industry, we can understand the shock to the retail industry employment. Our coefficient indicates a 94.8% chance of employment at pre-COVID levels. However, in our first 4 months elapsed since COVID, we see 7.6 percentage point  from our logit margins model, effectively reducing our chances of being employed to 87.2% chance. After 8 months pass, versus the first 4, we see less of a drop, with only a 3.2 percentage point change from the original 94.8%, resulting in a 91.6% possibility of being employed. As time progresses from the initial COVID shock, we see a stabilization each interval with less of a drop each time compared to pre-COVID levels. At the present, we only experience around a 0.2 percentage point drop from pre-COVID levels, effectively leaving us with a 94.6% possibility of being employed. The health of the retail industry suffered initially but found ways to stabilize as the pandemic progressed, likely due to external events like remote options become more abundant, and reopening with masks and vaccines.
+
+
+##### Question 2
+
+**How has retail fared relative to other industries?**
+
+When viewing our lpm results of each of the regressions for the 5 major non-retail industries compared to retail industries, we can see the differences in industry health fairly well. In the first 4 months, retail suffered a 7.5 percentage point drop in overall probability to be employed, leaving us with a 87.1% probability of unemployment. For non-retail industries, the Arts, Entertainment, and Recreation, and Accommodation and Food Services suffered the most, experiencing a 20.1 percentage point drop, resulting in a 73.1% probability of unemployment. The other four industries, Construction, Manufacturing,Educational Services, and Health Care and Social Assistance, and Professional, Scientific, and Management, and Administrative and Waste Management Services suffered less than the retail industry, only experiencing on average a 5.66 percentage point drop, with the exception of the Professional, Scientific, and Management, and Administrative and Waste Management Services experiencing only a 4 percentage point drop, resulting in a 91.1% of employment overall. However, the further progression into COVID (looking at coefficients for 12 MONTHS elapsed and beyond) indicates that the retail industry actually stabilized and became more resilient than other non-retail industries. Looking at the coefficients on 16 MONTHS elapsed, we can see that the retail industry experienced only a 1.6 percentage point drop relative to pre-COVID levels compared to Construction with a 2.5 percentage point drop, Manufacturing with a 2.0 percentage point drop, Arts, Entertainment, and Recreation, and Accommodation and Food Services with a 2.5 percentage point drop, and Professional, Scientific, and Management, and Administrative and Waste Management Services with a 1.9 percentage point drop. The only industry more resilient than retail at 16 months was Educational Services, and Health Care and Social Assistance with a 0.9 percentage point drop. Overall, while the retail industry health suffered immediately after the shock of COVID, it rebounded and became more resilient over time better than many of its non-retail counterparts.
+
+
+##### Question 3
+
+**Retail needs to worry about who has money to spend - what has changed about who is working and earning money?**
+
+Many of our regressions include controls indicating demographic information about sex, education, marital status, race, and age generation group. The coefficients in our model help us understand the differences in who is working and earning money across these demographic differences. Our models for different industries alongside the retail industry begin to illustrate the shift in who is working and who has money, indicated by the coefficients on months since COVID and their respective reduction to employment probability. The demographic variables within each of these provide insight into which age group is working primarily, whether single or married individuals earn the money, which race is working primarily, and how different education levels affect ability to earn. The coefficient for married allows us to see that across the industries, married individuals are predominantly more likely to be employed and earning money than single individuals. The same can be stated about those with a doctorate degree (excluding Construction), those who are male (excluding Arts, Entertainment, and Recreation, and Accommodation and Food Services), and white individuals.
